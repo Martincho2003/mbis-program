@@ -1,8 +1,11 @@
 import os
 import sys
 import hashlib
+import json
+import re
 import requests
 import smtplib
+from datetime import datetime, timedelta
 from email.message import EmailMessage
 from pathlib import Path
 
@@ -11,23 +14,176 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
 
 SCHEDULES_API_URL = "https://tu-sofia.bg/api/schedules"
-FALLBACK_PDF_URL = "https://tu-sofia.bg/api/documents/download?path=schedules%2F33NKmaZZD4fIaxF6UXfHxqwCfvh5hvhsWgNrI4m2.pdf&locale=bg"
+FALLBACK_PDF_URL = "https://tu-sofia.bg/api/documents/download?path=schedules%2Fn4HCmE1Khpl5zNVvmwzMdwkgiN1wJaG7mvYOHuro.pdf&locale=bg"
 
-HASH_FILE = Path("schedule_hash.txt")
-URL_FILE = Path("schedule_url.txt")
-PDF_FILE = Path("latest_schedule.pdf")
-HTML_FILE = Path("index.html")
+BASE_DIR = Path(__file__).resolve().parent
+HASH_FILE = BASE_DIR / "schedule_hash.txt"
+URL_FILE = BASE_DIR / "schedule_url.txt"
+PDF_FILE = BASE_DIR / "latest_schedule.pdf"
+HTML_FILE = BASE_DIR / "index.html"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 }
 
+WEEKS_START = [
+    "2026-10-05", "2026-10-12", "2026-10-19", "2026-10-26", "2026-11-02",
+    "2026-11-09", "2026-11-16", "2026-11-23", "2026-11-30", "2026-12-07",
+    "2026-12-14", "2027-01-04", "2027-01-11"
+]
+DAYS_BG = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]
+
+def resolve_room(room_raw: str, day_bg: str) -> str:
+    r = room_raw.strip()
+    if r == "3401/3501*":
+        return "3401" if day_bg == "Пн" else "3501"
+    if r == "3429/4130A**":
+        return "4130А" if day_bg == "Вт" else "3429"
+    if r == "4130Б/3507***":
+        return "3507" if day_bg == "Ср" else "4130Б"
+    if r in ("2101В/4130А****", "2101В/4130А-събота"):
+        return "4130А" if day_bg == "Сб" else "2101В"
+    if r == "3609/ 3507*****":
+        return "3507" if day_bg == "Ср" else "3609"
+    if r == "3509/3507":
+        return "3507" if day_bg in ("Ср", "Сб") else "3509"
+    return r
+
+def resolve_groups(grp_raw: str) -> list:
+    g = grp_raw.strip()
+    if g == "201/202/203":
+        return ["201А", "201Б", "201В", "202А", "202Б", "203"]
+    if g == "201":
+        return ["201А", "201Б", "201В"]
+    if g == "202":
+        return ["202А", "202Б"]
+    if g == "202A":
+        return ["202А"]
+    return [g]
+
+def parse_schedule_pdf(pdf_bytes: bytes):
+    import pymupdf
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    if not doc or len(doc) == 0:
+        return None, None
+    tables = doc[0].find_tables()
+    if not tables or not tables.tables:
+        return None, None
+
+    rows = tables[0].extract()
+    sessions = []
+    undated = []
+    curr_disc = ""
+
+    for r in rows[1:]:
+        if r[1] and r[1].strip():
+            curr_disc = r[1].strip()
+        kind = r[2].strip() if r[2] else "Л"
+        teacher = r[3].strip() if r[3] else ""
+        grp_raw = r[4].strip() if r[4] else ""
+        room_raw = r[5].strip() if r[5] else ""
+        start_weekday = r[6].strip() if r[6] else "16:30"
+        start_sat = r[7].strip() if r[7] else "8:30"
+        groups = resolve_groups(grp_raw)
+
+        has_any_week = False
+        for w_idx in range(13):
+            col_idx = 8 + w_idx
+            if col_idx >= len(r):
+                continue
+            val = r[col_idx]
+            if not val or not val.strip():
+                continue
+            has_any_week = True
+            w_num = w_idx + 1
+            w_start_dt = datetime.strptime(WEEKS_START[w_idx], "%Y-%m-%d")
+
+            lines = [l.strip() for l in val.split("\n") if l.strip()]
+            for line in lines:
+                m = re.match(r'^(.*?)\s+(\d+)\s*ч\.?$', line)
+                if not m:
+                    continue
+                day_spec = m.group(1).strip()
+                hours = int(m.group(2))
+
+                target_days = []
+                if day_spec == "Пн-Сб":
+                    target_days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб"]
+                elif day_spec == "Вт-Пт":
+                    target_days = ["Вт", "Ср", "Чт", "Пт"]
+                elif day_spec == "Ср-Пт":
+                    target_days = ["Ср", "Чт", "Пт"]
+                elif day_spec in DAYS_BG:
+                    target_days = [day_spec]
+                else:
+                    parts = [p.strip() for p in day_spec.split(",") if p.strip()]
+                    for p in parts:
+                        if p == "Ср-Пт":
+                            target_days.extend(["Ср", "Чт", "Пт"])
+                        elif p in DAYS_BG:
+                            target_days.append(p)
+
+                for d_name in target_days:
+                    day_offset = DAYS_BG.index(d_name)
+                    session_date = (w_start_dt + timedelta(days=day_offset)).strftime("%Y-%m-%d")
+                    start_time = start_sat if d_name == "Сб" else start_weekday
+                    room = resolve_room(room_raw, d_name)
+
+                    sessions.append({
+                        "w": w_num,
+                        "date": session_date,
+                        "day": d_name,
+                        "disc": curr_disc,
+                        "kind": kind,
+                        "teacher": teacher,
+                        "groups": groups,
+                        "room": room,
+                        "start": start_time,
+                        "h": hours
+                    })
+
+        if not has_any_week and curr_disc:
+            undated.append({
+                "disc": curr_disc,
+                "kind": kind,
+                "teacher": teacher,
+                "groups": groups,
+                "room": room_raw
+            })
+
+    return sessions, undated
+
+def update_index_html_from_pdf(pdf_bytes: bytes) -> bool:
+    if not HTML_FILE.exists():
+        return False
+    try:
+        sessions, undated = parse_schedule_pdf(pdf_bytes)
+        if not sessions:
+            print("[ВНИМАНИЕ] Не бяха извлечени занятия от PDF таблицата.")
+            return False
+
+        new_data = {
+            "sessions": sessions,
+            "undated": undated,
+            "weeks": WEEKS_START
+        }
+        data_str = json.dumps(new_data, ensure_ascii=False)
+
+        html = HTML_FILE.read_text(encoding="utf-8")
+        html_updated = re.sub(r'const DATA=\{.*?\};', f'const DATA={data_str};', html)
+        html_updated = re.sub(
+            r'const GROUPS=\[.*?\];',
+            'const GROUPS=["201А","201Б","201В","202А","202Б","203"];',
+            html_updated
+        )
+        HTML_FILE.write_text(html_updated, encoding="utf-8")
+        print(f"✅ index.html беше успешно обновен с {len(sessions)} занятия от новия разпис!")
+        return True
+    except Exception as e:
+        print(f"⚠️ Грешка при автоматично обновяване на index.html: {e}")
+        return False
+
 def get_latest_schedule_url() -> str:
-    """
-    Динамично извлича актуалния линк към разписа за специалност
-    'Мениджмънт и бизнес информационни системи' директно от API-то на сайта на ТУ-София,
-    което захранва бутоните на официалната страница /bg/weekly-schedule.
-    """
     print("Проверка на сайта на ТУ-София за актуален линк към разписа на МБИС...")
     params = {
         "type": "lectures",
@@ -140,10 +296,7 @@ def main():
         print(f"Стар линк: {old_url}")
     print(f"Нов линк:  {current_url}")
 
-    # Проверка дали има промяна или в хеша, или в самия URL
     is_changed = (new_hash != old_hash) or (old_url and current_url != old_url)
-
-    # Принудително тестване (ако е зададен FORCE_RUN=true)
     force_run = os.environ.get("FORCE_RUN", "").lower() == "true"
 
     if not is_changed and not force_run:
@@ -152,19 +305,22 @@ def main():
 
     print("⚠️ Открита е промяна в разписа!")
 
-    # Записваме новия хеш, URL и PDF
+    # 1. Записваме новия хеш, URL и PDF
     HASH_FILE.write_text(new_hash, encoding="utf-8")
     URL_FILE.write_text(current_url, encoding="utf-8")
     with open(PDF_FILE, "wb") as f:
         f.write(content)
 
-    # Маркираме за GitHub Actions че има промяна
+    # 2. Автоматично регенерираме index.html с новите данни
+    update_index_html_from_pdf(content)
+
+    # 3. Маркираме за GitHub Actions че има промяна
     gh_env = os.environ.get("GITHUB_ENV")
     if gh_env:
         with open(gh_env, "a", encoding="utf-8") as f:
             f.write("SCHEDULE_CHANGED=true\n")
 
-    # Изпращане на имейл известие
+    # 4. Изпращане на имейл известие
     send_email_notification(new_hash, current_url, content)
 
 if __name__ == "__main__":
