@@ -153,14 +153,68 @@ def parse_schedule_pdf(pdf_bytes: bytes):
 
     return sessions, undated
 
-def update_index_html_from_pdf(pdf_bytes: bytes) -> bool:
+def diff_sessions(old_sessions: list, new_sessions: list) -> list:
+    def session_key(s):
+        return (s.get('date'), s.get('start'), s.get('disc'), s.get('kind'), tuple(sorted(s.get('groups', []))))
+
+    old_map = {session_key(s): s for s in old_sessions}
+    new_map = {session_key(s): s for s in new_sessions}
+
+    added_keys = set(new_map.keys()) - set(old_map.keys())
+    removed_keys = set(old_map.keys()) - set(new_map.keys())
+    common_keys = set(old_map.keys()) & set(new_map.keys())
+
+    changes = []
+
+    # Промени в зала, часове или преподавател при съвпадащи часове
+    for k in sorted(common_keys):
+        old_s = old_map[k]
+        new_s = new_map[k]
+        mods = []
+        if old_s.get('room') != new_s.get('room'):
+            mods.append(f"зала {old_s.get('room')} ➔ {new_s.get('room')}")
+        if old_s.get('h') != new_s.get('h'):
+            mods.append(f"{old_s.get('h')} ч. ➔ {new_s.get('h')} ч.")
+        if old_s.get('teacher') != new_s.get('teacher'):
+            mods.append(f"преподавател {old_s.get('teacher')} ➔ {new_s.get('teacher')}")
+        if mods:
+            d, t, disc, kind, grps = k
+            grps_str = ", ".join(grps)
+            changes.append(f"📝 <b>{d} ({old_s.get('day')}): {disc} ({kind})</b> [{grps_str}]: " + ", ".join(mods))
+
+    # Добавени занятия
+    for k in sorted(added_keys):
+        s = new_map[k]
+        grps_str = ", ".join(s.get('groups', []))
+        changes.append(f"➕ <b>Добавено: {s.get('date')} ({s.get('day')})</b> — {s.get('disc')} ({s.get('kind')}), {s.get('h')} ч., от {s.get('start')} в зала {s.get('room')} [{grps_str}]")
+
+    # Премахнати / отпаднали занятия
+    for k in sorted(removed_keys):
+        s = old_map[k]
+        grps_str = ", ".join(s.get('groups', []))
+        changes.append(f"➖ <b>Отпаднало: {s.get('date')} ({s.get('day')})</b> — {s.get('disc')} ({s.get('kind')}), {s.get('h')} ч., от {s.get('start')} в зала {s.get('room')} [{grps_str}]")
+
+    return changes
+
+def update_index_html_from_pdf(pdf_bytes: bytes) -> tuple[bool, list]:
     if not HTML_FILE.exists():
-        return False
+        return False, []
     try:
         sessions, undated = parse_schedule_pdf(pdf_bytes)
         if not sessions:
             print("[ВНИМАНИЕ] Не бяха извлечени занятия от PDF таблицата.")
-            return False
+            return False, []
+
+        html = HTML_FILE.read_text(encoding="utf-8")
+        old_sessions = []
+        m = re.search(r'const DATA=(\{.*?\});', html)
+        if m:
+            try:
+                old_sessions = json.loads(m.group(1)).get('sessions', [])
+            except Exception:
+                pass
+
+        changes = diff_sessions(old_sessions, sessions)
 
         new_data = {
             "sessions": sessions,
@@ -169,7 +223,6 @@ def update_index_html_from_pdf(pdf_bytes: bytes) -> bool:
         }
         data_str = json.dumps(new_data, ensure_ascii=False)
 
-        html = HTML_FILE.read_text(encoding="utf-8")
         html_updated = re.sub(r'const DATA=\{.*?\};', f'const DATA={data_str};', html)
         html_updated = re.sub(
             r'const GROUPS=\[.*?\];',
@@ -178,10 +231,10 @@ def update_index_html_from_pdf(pdf_bytes: bytes) -> bool:
         )
         HTML_FILE.write_text(html_updated, encoding="utf-8")
         print(f"✅ index.html беше успешно обновен с {len(sessions)} занятия от новия разпис!")
-        return True
+        return True, changes
     except Exception as e:
         print(f"⚠️ Грешка при автоматично обновяване на index.html: {e}")
-        return False
+        return False, []
 
 def get_latest_schedule_url() -> str:
     print("Проверка на сайта на ТУ-София за актуален линк към разписа на МБИС...")
@@ -219,7 +272,7 @@ def download_pdf(url: str) -> bytes:
 def calculate_hash(content: bytes) -> str:
     return hashlib.sha256(content).hexdigest()
 
-def send_email_notification(new_hash: str, pdf_url: str, pdf_bytes: bytes):
+def send_email_notification(new_hash: str, pdf_url: str, pdf_bytes: bytes, changes: list = None):
     email_to = os.environ.get("EMAIL_TO")
     email_user = os.environ.get("EMAIL_USER")
     email_pass = os.environ.get("EMAIL_PASS")
@@ -237,6 +290,26 @@ def send_email_notification(new_hash: str, pdf_url: str, pdf_bytes: bytes):
 
     pages_link_html = f'<p>🌐 <b>Интерактивна онлайн програма (GitHub Pages):</b> <a href="{gh_pages_url}">{gh_pages_url}</a></p>' if gh_pages_url else ""
 
+    if changes:
+        changes_items = "".join(f"<li style='margin-bottom: 6px;'>{c}</li>" for c in changes)
+        diff_html = f"""
+        <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 14px 18px; margin: 18px 0;">
+          <h3 style="margin-top: 0; margin-bottom: 10px; color: #1e293b; font-size: 16px;">📋 Настъпили промени в разписа:</h3>
+          <ul style="padding-left: 20px; margin: 0; line-height: 1.5; font-size: 14px;">
+            {changes_items}
+          </ul>
+        </div>
+        """
+        plain_changes = "\n".join(f"- {re.sub('<[^<]+?>', '', c)}" for c in changes)
+        plain_text = f"Открита е промяна в разписа на ТУ-София за специалност МБИС.\nЛинк: {pdf_url}\n\nПромени:\n{plain_changes}\n\nВиж прикачените файлове."
+    else:
+        diff_html = """
+        <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 14px 18px; margin: 18px 0;">
+          <p style="margin: 0; color: #475569;">PDF разписът е обновен от университета (промяна в текстови бележки или формат).</p>
+        </div>
+        """
+        plain_text = f"Открита е промяна в разписа на ТУ-София за специалност МБИС.\nЛинк: {pdf_url}\n\nВиж прикачените файлове."
+
     html_content = f"""
     <html>
       <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
@@ -244,6 +317,7 @@ def send_email_notification(new_hash: str, pdf_url: str, pdf_bytes: bytes):
         <p>Автоматичната проверка откри обновяване на разписа за специалност <b>МБИС (Магистър)</b> на сайта на ТУ-София.</p>
         <p>📥 <b>Директен линк от сайта:</b> <a href="{pdf_url}">{pdf_url}</a></p>
         <p>🔑 <b>Контролен хеш на новия файл (SHA-256):</b> <code>{new_hash[:16]}...</code></p>
+        {diff_html}
         {pages_link_html}
         <p>В прикачения файл ще намериш новия <b>PDF разпис</b> от университета, както и обновения интерактивен <b>index.html</b>.</p>
         <hr style="border: 0; border-top: 1px solid #eee; margin: 20px 0;">
@@ -251,7 +325,7 @@ def send_email_notification(new_hash: str, pdf_url: str, pdf_bytes: bytes):
       </body>
     </html>
     """
-    msg.set_content(f"Открита е промяна в разписа на ТУ-София за специалност МБИС.\nЛинк: {pdf_url}\nВиж прикачените файлове.")
+    msg.set_content(plain_text)
     msg.add_alternative(html_content, subtype="html")
 
     # Прикачване на новия PDF
@@ -311,8 +385,8 @@ def main():
     with open(PDF_FILE, "wb") as f:
         f.write(content)
 
-    # 2. Автоматично регенерираме index.html с новите данни
-    update_index_html_from_pdf(content)
+    # 2. Автоматично регенерираме index.html с новите данни и извличаме разликите
+    success, changes = update_index_html_from_pdf(content)
 
     # 3. Маркираме за GitHub Actions че има промяна
     gh_env = os.environ.get("GITHUB_ENV")
@@ -320,8 +394,8 @@ def main():
         with open(gh_env, "a", encoding="utf-8") as f:
             f.write("SCHEDULE_CHANGED=true\n")
 
-    # 4. Изпращане на имейл известие
-    send_email_notification(new_hash, current_url, content)
+    # 4. Изпращане на имейл известие с точния списък на промените
+    send_email_notification(new_hash, current_url, content, changes)
 
 if __name__ == "__main__":
     main()

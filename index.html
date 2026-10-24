@@ -203,8 +203,23 @@ function render(){
     const fn=DISC_NAMES[s.disc]||s.disc;
     x.innerHTML=`<div class="t"><span><span class="k">${s.kind==="Л"?"Л":"ЛУ"}</span><span title="${esc(fn)}">${esc(s.disc)}</span>${isLive?'<span class="badge-now"><span class="dot-white"></span>Сега</span>':""}</span><em>${s.start}</em></div><div class="m">${s.h} ч. · зала ${esc(s.room)}<br>${esc(s.teacher)}</div>`;
     body.appendChild(x)});
-   if(list.length>1){const sum=list.reduce((a,s)=>a+s.h,0);
-    body.appendChild(el("div","warn",j===5&&sum<=10?`Две занятия от 8:30 (общо ${sum} ч.) — редът не е посочен.`:`Застъпване: ${list.length} занятия от ${list[0].start} (общо ${sum} ч.) — уточни кое важи.`))}
+   if(list.length>1){
+    let hasCol=false;
+    for(let a=0;a<list.length;a++){
+     for(let b=a+1;b<list.length;b++){
+      const [sh1,sm1]=list[a].start.split(":").map(Number);
+      const [sh2,sm2]=list[b].start.split(":").map(Number);
+      const st1=sh1*60+sm1,en1=st1+list[a].h*50;
+      const st2=sh2*60+sm2,en2=st2+list[b].h*50;
+      if(st1<en2&&st2<en1){hasCol=true;break}
+     }
+     if(hasCol)break;
+    }
+    if(hasCol){
+     const sum=list.reduce((a,s)=>a+s.h,0);
+     body.appendChild(el("div","warn",j===5&&sum<=10?`Две занятия от 8:30 (общо ${sum} ч.) — редът не е посочен.`:`Застъпване в часовете: ${list.length} занятия с припокриващо се време — провери кое важи.`));
+    }
+   }
    c.appendChild(body);grid.appendChild(c)});
   box.appendChild(grid);W.appendChild(box)});
  const u=DATA.undated.filter(s=>s.groups.includes(G));
